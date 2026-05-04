@@ -375,12 +375,20 @@ async def _api_post(
 ) -> Dict[str, Any]:
     body = _json_dumps({**payload, "base_info": _base_info()})
     url = f"{base_url.rstrip('/')}/{endpoint}"
-    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
-    async with session.post(url, data=body, headers=_headers(token, body), timeout=timeout) as response:
-        raw = await response.text()
-        if not response.ok:
-            raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+    # Use aiohttp.ClientTimeout (passed to the request) instead of
+    # asyncio.timeout(), because asyncio.timeout() fails with
+    # "Timeout context manager should be used inside a task" when the
+    # session is used across threads/event loops (aiohttp 3.13+).
+    timeout_seconds = timeout_ms / 1000
+    client_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    try:
+        async with session.post(url, data=body, headers=_headers(token, body), timeout=client_timeout) as response:
+            raw = await response.text()
+            if not response.ok:
+                raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
+            return json.loads(raw)
+    except asyncio.TimeoutError:
+        raise asyncio.TimeoutError(f"iLink POST {endpoint} timed out after {timeout_ms}ms")
 
 
 async def _api_get(
@@ -395,12 +403,16 @@ async def _api_get(
         "iLink-App-Id": ILINK_APP_ID,
         "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION),
     }
-    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
-    async with session.get(url, headers=headers, timeout=timeout) as response:
-        raw = await response.text()
-        if not response.ok:
-            raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+    timeout_seconds = timeout_ms / 1000
+    client_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    try:
+        async with session.get(url, headers=headers, timeout=client_timeout) as response:
+            raw = await response.text()
+            if not response.ok:
+                raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
+            return json.loads(raw)
+    except asyncio.TimeoutError:
+        raise asyncio.TimeoutError(f"iLink GET {endpoint} timed out after {timeout_ms}ms")
 
 
 async def _get_updates(
@@ -548,17 +560,25 @@ async def _upload_ciphertext(
     Accepts either a constructed CDN URL (from upload_param) or a direct
     upload_full_url — both use POST with the raw ciphertext as the body.
     """
-    timeout = aiohttp.ClientTimeout(total=120)
-    async with session.post(upload_url, data=ciphertext, headers={"Content-Type": "application/octet-stream"}, timeout=timeout) as response:
-        if response.status == 200:
-            encrypted_param = response.headers.get("x-encrypted-param")
-            if encrypted_param:
-                await response.read()
-                return encrypted_param
-            raw = await response.text()
-            raise RuntimeError(f"CDN upload missing x-encrypted-param header: {raw[:200]}")
-        raw = await response.text()
-        raise RuntimeError(f"CDN upload HTTP {response.status}: {raw[:200]}")
+    client_timeout = aiohttp.ClientTimeout(total=120)
+    try:
+        async with session.post(
+            upload_url,
+            data=ciphertext,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=client_timeout,
+        ) as response:
+                if response.status == 200:
+                    encrypted_param = response.headers.get("x-encrypted-param")
+                    if encrypted_param:
+                        await response.read()
+                        return encrypted_param
+                    raw = await response.text()
+                    raise RuntimeError(f"CDN upload missing x-encrypted-param header: {raw[:200]}")
+                raw = await response.text()
+                raise RuntimeError(f"CDN upload HTTP {response.status}: {raw[:200]}")
+    except asyncio.TimeoutError:
+        raise asyncio.TimeoutError(f"CDN upload timed out after 120s for {upload_url}")
 
 
 async def _download_bytes(
@@ -567,10 +587,13 @@ async def _download_bytes(
     url: str,
     timeout_seconds: float = 60.0,
 ) -> bytes:
-    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with session.get(url, timeout=timeout) as response:
-        response.raise_for_status()
-        return await response.read()
+    client_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    try:
+        async with session.get(url, timeout=client_timeout) as response:
+            response.raise_for_status()
+            return await response.read()
+    except asyncio.TimeoutError:
+        raise asyncio.TimeoutError(f"Download from {url} timed out after {timeout_seconds}s")
 
 
 _WEIXIN_CDN_ALLOWLIST: frozenset[str] = frozenset(
@@ -1817,13 +1840,17 @@ class WeixinAdapter(BasePlatformAdapter):
             raise ValueError(f"Blocked unsafe URL (SSRF protection): {url}")
 
         assert self._send_session is not None
-        async with self._send_session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-            response.raise_for_status()
-            data = await response.read()
-            suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-            handle.write(data)
-            return handle.name
+        client_timeout = aiohttp.ClientTimeout(total=30)
+        try:
+            async with self._send_session.get(url, timeout=client_timeout) as response:
+                response.raise_for_status()
+                data = await response.read()
+                suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+                handle.write(data)
+                return handle.name
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(f"Remote media download from {url} timed out after 30s")
 
     async def _send_file(
         self,
@@ -2028,35 +2055,14 @@ async def send_weixin_direct(
     token_store.restore(account_id)
     context_token = token_store.get(account_id, chat_id)
 
-    live_adapter = _LIVE_ADAPTERS.get(resolved_token)
-    send_session = getattr(live_adapter, '_send_session', None)
-    if (live_adapter is not None and send_session is not None
-            and not send_session.closed
-            and send_session._loop is asyncio.get_running_loop()):
-        last_result: Optional[SendResult] = None
-        cleaned = live_adapter.format_message(message)
-        if cleaned:
-            last_result = await live_adapter.send(chat_id, cleaned)
-            if not last_result.success:
-                return {"error": f"Weixin send failed: {last_result.error}"}
-
-        for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await live_adapter.send_image_file(chat_id, media_path)
-            else:
-                last_result = await live_adapter.send_document(chat_id, media_path)
-            if not last_result.success:
-                return {"error": f"Weixin media send failed: {last_result.error}"}
-
-        return {
-            "success": True,
-            "platform": "weixin",
-            "chat_id": chat_id,
-            "message_id": last_result.message_id if last_result else None,
-            "context_token_used": bool(context_token),
-        }
-
+    # Always create our own aiohttp.ClientSession here rather than
+    # reusing live_adapter._send_session.  The live adapter's session
+    # was created in the gateway's event loop; when this function runs
+    # (via send_message tool -> _run_async) it executes in a different
+    # event loop/thread, so sharing the session would cause:
+    #   "Timeout context manager should be used inside a task"
+    #   "Future attached to a different loop"
+    # errors with aiohttp 3.13+.
     async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
         adapter = WeixinAdapter(
             PlatformConfig(

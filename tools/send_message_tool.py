@@ -1767,6 +1767,45 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         return _error(f"Yuanbao send failed: {e}")
 
 
+# ============================================================================
+# Convenience helpers for internal use (bypass.log notifications, etc.)
+# ============================================================================
+
+def send_feishu_notification(message: str, chat_id: str | None = None) -> dict:
+    """Send a plain text Feishu notification from any thread (sync wrapper).
+
+    Used by skills_tool.py to notify the Feishu group when a sub-agent's
+    skill is blocked (L4 bypass.log write), and by other internal callers.
+
+    Args:
+        message: Plain text message to send.
+        chat_id: Target Feishu chat_id.  Defaults to the 潘钰文和他的小妞们 group.
+
+    Returns:
+        {"success": True, ...} or {"error": "..."}
+    """
+    # Default to the 潘钰文和他的小妞们 group (银月家的主群)
+    _DEFAULT_FEISHU_GROUP = "oc_08a798e06860c6b905f8090aec40208b"
+    if chat_id is None:
+        chat_id = _DEFAULT_FEISHU_GROUP
+
+    if not chat_id:
+        return {"error": "No Feishu chat_id configured for notifications"}
+
+    # Call _handle_send directly to avoid circular-import issues with registry
+    try:
+        result = _handle_send({
+            "target": f"feishu:{chat_id}",
+            "message": message,
+        })
+        if isinstance(result, str):
+            import json as _json
+            return _json.loads(result)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 

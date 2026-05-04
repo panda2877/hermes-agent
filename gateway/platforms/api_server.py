@@ -606,6 +606,84 @@ class APIServerAdapter(BasePlatformAdapter):
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._session_store: Any = None  # Wired via set_session_store()
+
+    # ── Session store (wired by gateway) ─────────────────────────────────
+
+    def set_session_store(self, session_store: Any) -> None:
+        self._session_store = session_store
+
+    # ── Session API handlers ──────────────────────────────────────────────
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions — list all gateway sessions."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._session_store:
+            return web.json_response({"error": "Session store unavailable"}, status=503)
+        try:
+            limit = int(request.query.get("limit", 50))
+            offset = int(request.query.get("offset", 0))
+        except ValueError:
+            return web.json_response({"error": "invalid limit/offset"}, status=400)
+
+        entries = self._session_store.list_sessions()
+        entries.sort(key=lambda e: e.updated_at, reverse=True)
+        total = len(entries)
+        page = list(entries)[offset : offset + limit]
+
+        def _entry_to_dict(e):
+            return {
+                "key": e.session_key,
+                "id": e.session_id,
+                "title": e.display_name or e.session_key,
+                "platform": e.platform.value if e.platform else None,
+                "chat_type": e.chat_type,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+                "input_tokens": e.input_tokens,
+                "output_tokens": e.output_tokens,
+                "total_tokens": e.total_tokens,
+                "origin": e.origin.to_dict() if e.origin else None,
+            }
+
+        return web.json_response({
+            "items": [_entry_to_dict(e) for e in page],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        })
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_key} — get a single gateway session entry."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not self._session_store:
+            return web.json_response({"error": "Session store unavailable"}, status=503)
+        session_key = request.match_info.get("session_key", "")
+        self._session_store._ensure_loaded()
+        entry = self._session_store._entries.get(session_key)
+        if not entry:
+            return web.json_response({"error": "Session not found"}, status=404)
+
+        def _entry_to_dict(e):
+            return {
+                "key": e.session_key,
+                "id": e.session_id,
+                "title": e.display_name or e.session_key,
+                "platform": e.platform.value if e.platform else None,
+                "chat_type": e.chat_type,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+                "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+                "input_tokens": e.input_tokens,
+                "output_tokens": e.output_tokens,
+                "total_tokens": e.total_tokens,
+                "origin": e.origin.to_dict() if e.origin else None,
+            }
+
+        return web.json_response({"session": _entry_to_dict(entry)})
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -2807,6 +2885,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # Session store API
+            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_get("/api/sessions/{session_key}", self._handle_get_session)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)

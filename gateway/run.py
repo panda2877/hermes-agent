@@ -9430,49 +9430,48 @@ class GatewayRunner:
         name = event.get_command_args().strip()
 
         if not name:
-            # List recent titled sessions for this user/platform
+            # No name given — default to "session-wechat", fall back to most recent
             try:
-                user_source = source.platform.value if source.platform else None
-                sessions = self._session_db.list_sessions_rich(
-                    source=user_source, limit=10
-                )
-                titled = [s for s in sessions if s.get("title")]
-                if not titled:
-                    return (
-                        "No named sessions found.\n"
-                        "Use `/title My Session` to name your current session, "
-                        "then `/resume My Session` to return to it later."
+                target_id = self._session_db.resolve_session_by_title("session-wechat")
+                if target_id:
+                    target_title = "session-wechat"
+                else:
+                    # Fall back to most recent session
+                    user_source = source.platform.value if source.platform else None
+                    sessions = self._session_db.list_sessions_rich(
+                        source=user_source, limit=10
                     )
-                lines = ["📋 **Named Sessions**\n"]
-                for s in titled[:10]:
-                    title = s["title"]
-                    preview = s.get("preview", "")[:40]
-                    preview_part = f" — _{preview}_" if preview else ""
-                    lines.append(f"• **{title}**{preview_part}")
-                lines.append("\nUsage: `/resume <session name>`")
-                return "\n".join(lines)
+                    if sessions:
+                        target_id = sessions[0].get("id")
+                        target_title = sessions[0].get("title") or sessions[0].get("preview", "recent session")[:40]
+                    else:
+                        return (
+                            "No previous sessions found.\n"
+                            "Start a new conversation — I'll remember it for next time."
+                        )
             except Exception as e:
-                logger.debug("Failed to list titled sessions: %s", e)
+                logger.debug("Failed to list sessions for resume: %s", e)
                 return f"Could not list sessions: {e}"
-
-        # Resolve the name to a session ID.
-        target_id = self._session_db.resolve_session_by_title(name)
-        if not target_id:
-            return (
-                f"No session found matching '**{name}**'.\n"
-                "Use `/resume` with no arguments to see available sessions."
-            )
-        # Compression creates child continuations that hold the live transcript.
-        # Follow that chain so gateway /resume matches CLI behavior (#15000).
-        try:
-            target_id = self._session_db.resolve_resume_session_id(target_id)
-        except Exception as e:
-            logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
+        else:
+            # Resolve the name to a session ID
+            target_id = self._session_db.resolve_session_by_title(name)
+            if not target_id:
+                return (
+                    f"No session found matching '**{name}**'.\n"
+                    "Use `/resume` with no arguments to see available sessions."
+                )
+            target_title = name
+            # Compression creates child continuations that hold the live transcript.
+            # Follow that chain so gateway /resume matches CLI behavior (#15000).
+            try:
+                target_id = self._session_db.resolve_resume_session_id(target_id)
+            except Exception as e:
+                logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
         # Check if already on that session
         current_entry = self.session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
-            return f"📌 Already on session **{name}**."
+            return f"📌 Already on session **{target_title}**."
 
         # Clear any running agent for this session key
         self._release_running_agent_state(session_key)
@@ -9498,7 +9497,7 @@ class GatewayRunner:
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         msg_part = f" ({msg_count} message{'s' if msg_count != 1 else ''})" if msg_count else ""
 
-        return f"↻ Resumed session **{title}**{msg_part}. Conversation restored."
+        return f"↻ Resumed session **{target_title}**{msg_part}. Conversation restored."
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
         """Handle /branch [name] — fork the current session into a new independent copy.
