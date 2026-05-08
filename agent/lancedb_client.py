@@ -219,3 +219,23 @@ def is_api_available() -> bool:
     """Quick health check — returns True if LanceDB API is reachable."""
     data = _api_get("/status")
     return data is not None and data.get("status") == "ok"
+
+
+def write_memory(agent_name: str, content: str, category: str = "memory") -> bool:
+    """Write a memory entry to LanceDB.
+
+    Args:
+        agent_name: The agent profile name (e.g. "xingruyin", "ziling").
+        content: The memory content string to store.
+        category: "memory" (default) or "user".
+
+    Returns:
+        True if the write succeeded, False otherwise.
+    """
+    if not agent_name or not content:
+        return False
+    data = _api_post(
+        f"/memories/{agent_name}",
+        {"content": content, "category": category},
+    )
+    return data is not None

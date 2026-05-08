@@ -124,12 +124,52 @@ class MemoryStore:
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
+        """Load entries from LanceDB (primary) or fall back to MEMORY.md/USER.md.
+
+        Priority:
+          0. LanceDB ``souls`` / ``memories`` tables via ``agent.lancedb_client``
+          1. Fallback files ``~/.hermes/memories/MEMORY.md`` and ``USER.md``
+
+        This unifies the dual-track memory system: all reads now go through
+        LanceDB first, with files as a durable offline backup.
+        """
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        # ── Try LanceDB first ─────────────────────────────────────────────
+        _lancedb_memory: List[str] = []
+        _lancedb_user: List[str] = []
+        _lancedb_available = False
+
+        try:
+            from agent.lancedb_client import fetch_memories, fetch_user
+
+            # Determine agent name from HERMES_HOME (same logic as prompt_builder)
+            _soul_home = get_hermes_home()
+            _agent_name = _soul_home.name if _soul_home.name != "home" else None
+
+            if _agent_name:
+                _lancedb_memory = fetch_memories(_agent_name)
+                _lancedb_user_content = fetch_user()
+                _lancedb_user = [_lancedb_user_content] if _lancedb_user_content else []
+                _lancedb_available = True
+
+        except Exception as e:
+            logger.debug("LanceDB memory fetch failed: %s", e)
+
+        # ── Fall back to files if LanceDB unavailable or empty ────────────
+        if _lancedb_available and (_lancedb_memory or _lancedb_user):
+            self.memory_entries = _lancedb_memory
+            self.user_entries = _lancedb_user
+            logger.info(
+                "Loaded %d memory entries + %d user entries from LanceDB",
+                len(_lancedb_memory), len(_lancedb_user),
+            )
+        else:
+            self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
+            self.user_entries = self._read_file(mem_dir / "USER.md")
+            if _lancedb_available and not _lancedb_memory and not _lancedb_user:
+                logger.debug("LanceDB returned empty; using file backup")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -195,9 +235,21 @@ class MemoryStore:
         self._set_entries(target, fresh)
 
     def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
+        """Persist entries to file + LanceDB. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
+
+        # Sync to LanceDB as well
+        try:
+            from agent.lancedb_client import write_memory
+
+            _soul_home = get_hermes_home()
+            _agent_name = _soul_home.name if _soul_home.name != "home" else None
+            if _agent_name:
+                for entry in self._entries_for(target):
+                    write_memory(_agent_name, entry, category=target)
+        except Exception as e:
+            logger.debug("LanceDB memory write failed (non-fatal): %s", e)
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
