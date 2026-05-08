@@ -725,6 +725,35 @@ class Run:
 
 
 @dataclass
+class Agent:
+    """In-memory view of a row from the ``agent_registry`` table."""
+
+    id: str
+    profile: str
+    name: str
+    role: str
+    capabilities: list[str]
+    status: str
+    registered_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Agent":
+        try:
+            caps = json.loads(row["capabilities"]) if row["capabilities"] else []
+        except Exception:
+            caps = []
+        return cls(
+            id=row["id"],
+            profile=row["profile"],
+            name=row["name"],
+            role=row["role"],
+            capabilities=caps,
+            status=row["status"],
+            registered_at=int(row["registered_at"]),
+        )
+
+
+@dataclass
 class Comment:
     id: int
     task_id: str
@@ -863,6 +892,20 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Agent identity registry. Unlike claim_lock (task-level, 15-min TTL),
+-- agent_registry is long-lived: it records which profiles are active,
+-- their roles/capabilities, and current status for board visibility
+-- and task-routing reference.
+CREATE TABLE IF NOT EXISTS agent_registry (
+    id            TEXT PRIMARY KEY,
+    profile       TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'generalist',
+    capabilities  TEXT NOT NULL DEFAULT '[]',
+    status        TEXT NOT NULL DEFAULT 'idle',
+    registered_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_tenant          ON tasks(tenant);
@@ -926,6 +969,7 @@ def connect(
         # process are cheap.
         conn.executescript(SCHEMA_SQL)
         _migrate_add_optional_columns(conn)
+        _migrate_add_agent_registry(conn)
         _INITIALIZED_PATHS.add(resolved)
     return conn
 
@@ -1112,6 +1156,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
+
+
+def _migrate_add_agent_registry(conn: sqlite3.Connection) -> None:
+    """Create agent_registry if it doesn't exist.
+
+    Uses CREATE TABLE IF NOT EXISTS so this is idempotent for fresh DBs.
+    For legacy DBs that predate this table, it creates it with no data
+    (agents must re-register after any dispatcher restart that touches
+    a fresh process).
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_registry (
+            id            TEXT PRIMARY KEY,
+            profile       TEXT NOT NULL UNIQUE,
+            name          TEXT NOT NULL,
+            role          TEXT NOT NULL DEFAULT 'generalist',
+            capabilities  TEXT NOT NULL DEFAULT '[]',
+            status        TEXT NOT NULL DEFAULT 'idle',
+            registered_at INTEGER NOT NULL
+        )
+        """
+    )
 
 
 @contextlib.contextmanager
@@ -4469,3 +4536,82 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Agent Registry (CRUD)
+# ---------------------------------------------------------------------------
+
+
+def register_agent(
+    conn: sqlite3.Connection,
+    *,
+    id: str,
+    profile: str,
+    name: str,
+    role: str = "generalist",
+    capabilities: Optional[list[str]] = None,
+    status: str = "idle",
+) -> Agent:
+    """Register (or update) an agent's identity in the registry.
+
+    Uses INSERT OR REPLACE so calling this multiple times is safe — it
+    always reflects the caller's latest identity snapshot.
+    """
+    caps_json = json.dumps(capabilities or [], ensure_ascii=False, sort_keys=True)
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO agent_registry
+                (id, profile, name, role, capabilities, status, registered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (id, profile, name, role, caps_json, status, now),
+        )
+    return Agent(
+        id=id,
+        profile=profile,
+        name=name,
+        role=role,
+        capabilities=capabilities or [],
+        status=status,
+        registered_at=now,
+    )
+
+
+def update_agent_status(
+    conn: sqlite3.Connection,
+    *,
+    id: str,
+    status: str,
+) -> Optional[Agent]:
+    """Update an agent's status in the registry.
+
+    Returns the updated row, or None if the agent is not registered.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE agent_registry SET status = ? WHERE id = ?",
+            (status, id),
+        )
+        if cur.rowcount == 0:
+            return None
+    row = conn.execute(
+        "SELECT * FROM agent_registry WHERE id = ?", (id,)
+    ).fetchone()
+    return Agent.from_row(row) if row else None
+
+
+def get_agent(conn: sqlite3.Connection, id: str) -> Optional[Agent]:
+    """Look up a single agent by id."""
+    row = conn.execute(
+        "SELECT * FROM agent_registry WHERE id = ?", (id,)
+    ).fetchone()
+    return Agent.from_row(row) if row else None
+
+
+def list_agents(conn: sqlite3.Connection) -> list[Agent]:
+    """Return all registered agents."""
+    rows = conn.execute("SELECT * FROM agent_registry ORDER BY registered_at ASC")
+    return [Agent.from_row(r) for r in rows]
