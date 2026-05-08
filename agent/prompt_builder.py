@@ -1032,31 +1032,47 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
 
 
 def load_soul_md() -> Optional[str]:
-    """Load SOUL.md from HERMES_HOME and return its content, or None.
+    """Load agent identity.
+
+    Priority (handled inside fetch_soul):
+      0. LanceDB ``souls`` table, filtered by agent profile name
+      1. Fallback file ``/home/agentuser/.hermes/SOUL.md`` (synced from LanceDB)
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
-    try:
-        from hermes_cli.config import ensure_hermes_home
-        ensure_hermes_home()
-    except Exception as e:
-        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+    import os as _os
 
-    soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
-        return None
+    # ── LanceDB (with file fallback inside fetch_soul) ──
     try:
-        content = soul_path.read_text(encoding="utf-8").strip()
-        if not content:
-            return None
-        content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(content, "SOUL.md")
-        return content
+        from agent.lancedb_client import fetch_soul
+        _soul_home = get_hermes_home()
+        _profile_name = _soul_home.name if _soul_home.name != "home" else None
+        if _profile_name:
+            _soul_content = fetch_soul(_profile_name)
+            if _soul_content:
+                _soul_content = _scan_context_content(_soul_content, "SOUL.md")
+                _soul_content = _truncate_content(_soul_content, "SOUL.md")
+                return _soul_content
     except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
-        return None
+        logger.debug("LanceDB soul fetch failed: %s", e)
+
+    # ── Ultimate fallback: global SOUL.md ──
+    global_home = _os.path.expanduser("~/.hermes")
+    global_soul = Path(global_home) / "SOUL.md"
+    if global_soul.exists():
+        try:
+            content = global_soul.read_text(encoding="utf-8").strip()
+            if content:
+                logger.debug("Loaded SOUL.md from global %s", global_soul)
+                content = _scan_context_content(content, "SOUL.md")
+                content = _truncate_content(content, "SOUL.md")
+                return content
+        except Exception as e:
+            logger.debug("Could not read global SOUL.md: %s", e)
+
+    return None
 
 
 def _load_hermes_md(cwd_path: Path) -> str:
