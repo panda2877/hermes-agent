@@ -124,12 +124,47 @@ class MemoryStore:
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
+        """Load entries from LanceDB, capture system prompt snapshot.
+
+        Priority:
+          0. LanceDB — memories table (primary, no file fallback)
+          0. LanceDB — user table (fallback to shared USER.md)
+        """
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        # ── Priority 0: LanceDB ─────────────────────────
+        try:
+            from agent.lancedb_client import fetch_user, fetch_memories
+
+            # Determine agent name from HERMES_HOME profile path
+            _home = get_hermes_home()
+            # HOME is profiles/<agent_name>, so .name is the agent name
+            _profile_name = _home.name if _home.name != "home" else None
+
+            # Load user profile from LanceDB (falls back to shared USER.md internally)
+            _user_content = fetch_user()
+            if _user_content:
+                self.user_entries = [_user_content]
+                logger.info("Loaded user from LanceDB (%d chars)", len(_user_content))
+            else:
+                logger.debug("LanceDB user fetch returned empty, falling back to file")
+
+            # Load memories from LanceDB only — no file fallback
+            if _profile_name:
+                _mem_entries = fetch_memories(_profile_name)
+                if _mem_entries:
+                    self.memory_entries = _mem_entries
+                    logger.info("Loaded %d memories from LanceDB for agent=%s",
+                                len(_mem_entries), _profile_name)
+                else:
+                    logger.debug("No memories in LanceDB for agent=%s", _profile_name)
+        except Exception as e:
+            logger.debug("LanceDB load failed: %s", e)
+
+        # ── File fallback: user only (memories are LanceDB-only) ──
+        if not self.user_entries:
+            self.user_entries = self._read_file(mem_dir / "USER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
