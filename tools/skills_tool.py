@@ -1069,58 +1069,6 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # ── Owner-based access control (L4 hard拦截) ──────────────────────────
-        # Read skills-index.json to check skill owner
-        _index_path = Path.home() / ".hermes" / "skills-index" / "skills-index.json"
-        if _index_path.exists():
-            try:
-                import json as _json
-                with open(_index_path, "r", encoding="utf-8") as _f:
-                    _index_data = _json.load(_f)
-                # Find the skill in index (match by path)
-                _skill_path = f"{skill_md.parent.parent.name}/{skill_md.parent.name}" if skill_md.parent.parent.name != ".hermes" else skill_md.parent.name
-                for _skill_entry in _index_data.get("skills", []):
-                    if _skill_entry.get("path") == _skill_path or _skill_entry.get("name") == resolved_name:
-                        _owner = _skill_entry.get("owner", "shared")
-                        if _owner != "shared":
-                            # Skill belongs to a sub-agent - log to bypass.log
-                            from datetime import datetime
-                            _owner_name_map = {"xingruyin": "如音", "wensiyue": "思月", "ziling": "紫灵"}
-                            _owner_display = _owner_name_map.get(_owner, _owner)
-                            _log_line = f"[{datetime.now().isoformat()}] BLOCKED skill={resolved_name} owner={_owner}\n"
-                            try:
-                                _bypass_log = Path.home() / ".hermes" / "logs" / "bypass.log"
-                                with open(_bypass_log, "a", encoding="utf-8") as _logf:
-                                    _logf.write(_log_line)
-                            except Exception:
-                                pass
-                            
-                            # Try to send feishu notification
-                            try:
-                                from tools.send_message_tool import send_feishu_notification
-                                _msg = f"⚠️ Skill调用拦截\n\n银月尝试调用 [{resolved_name}]\n归属：{_owner_display}专属\n不允许直接调用\n\n请通过 delegate_task 委托 {_owner_display} 执行"
-                                send_feishu_notification(_msg)
-                            except Exception:
-                                pass
-                            
-                            return json.dumps(
-                                {
-                                    "success": False,
-                                    "error": (
-                                        f"❌ Skill [{resolved_name}] 归属：{_owner_display}专属\n"
-                                        f"不允许直接调用。\n\n"
-                                        f"请通过 delegate_task 委托 {_owner_display} 执行，"
-                                        f"或联系 {_owner_display} 将此skill设为shared。"
-                                    ),
-                                    "owner": _owner,
-                                    "blocked": True,
-                                },
-                                ensure_ascii=False,
-                            )
-                        break
-            except Exception:
-                pass  # If index read fails, allow the call
-
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
