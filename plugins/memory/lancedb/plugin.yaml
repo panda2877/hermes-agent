@@ -1,0 +1,6 @@
+name: lancedb
+version: 1.0.0
+description: "LanceDB memory provider — persistent soul/user/memory store backed by LanceDB HTTP API."
+pip_dependencies: []
+hooks:
+  - on_session_end
