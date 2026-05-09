@@ -1083,6 +1083,16 @@ def _build_child_agent(
         child_providers_order = None
         child_provider_sort = None
 
+    # Generate a child session_id that traces back to the parent,
+    # so subagent conversations are written to SQLite under their own
+    # session_id instead of polluting the parent's session namespace.
+    _parent_sid = getattr(parent_agent, "session_id", None)
+    child_session_id = (
+        f"{_parent_sid}_sub_{_uuid.uuid4().hex[:8]}"
+        if _parent_sid
+        else None
+    )
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1101,12 +1111,13 @@ def _build_child_agent(
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
+        session_id=child_session_id,
         skip_context_files=True,
         skip_memory=True,
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
+        parent_session_id=_parent_sid,
         providers_allowed=child_providers_allowed,
         providers_ignored=child_providers_ignored,
         providers_order=child_providers_order,
@@ -1580,6 +1591,7 @@ def _run_single_child(
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
+                "child_session_id": getattr(child, "session_id", None),
                 "diagnostic_path": diagnostic_path,
             }
         finally:
@@ -1694,6 +1706,7 @@ def _run_single_child(
                 )
                 else 0.0
             ),
+            "child_session_id": getattr(child, "session_id", None),
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
